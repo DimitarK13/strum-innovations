@@ -2,23 +2,24 @@
 """
 Possession labeller for both halves  (H / A / D, X where not graded)
 
-Run from the repo root (needs data/ in place and `pip install kloppy`):
+Run from the repo root (needs data/ in place, see requirements):
 
-    python possession_match.py                       # both halves -> evaluation/results/full_match.csv
-    python possession_match.py --half 1              # first half only
-    python possession_match.py --half 2              # second half only
-    python possession_match.py --minutes 5           # first 5 minutes after each kick-off (quick test)
-    python possession_match.py --diagnose            # compare cues / set-piece tags with the public GT
+    python -m solution.run                       # both halves -> evaluation/results/full_match.csv
+    python -m solution.run --half 1              # first half only (partial file)
+    python -m solution.run --half 2              # second half only (partial file)
+    python -m solution.run --minutes 5           # quick test -> evaluation/results/quick_test.csv
+    python -m solution.run --diagnose            # compare cues / set-piece tags with the public GT
 
 Pipeline (per half)
   1. Load ATD + Smart Tagging and put both on the video-frame index.
   2. Per-frame evidence
        team evidence : which team is nearer the ball, and how decisively
-       dead evidence : ball out of bounds / ball still / players slow / set-piece window
+       dead evidence : ball out of bounds / ball still / ball lost / players slow / set-piece window
   3. 3-state Viterbi (H, A, D) with switch penalties -> sticky possessions, no flicker.
        A frame without evidence (ball missing, ball in the air) simply keeps the last state.
   4. Second pass: the team that takes a set piece gets a short prior after the restart.
-  5. Write a 199,319-row CSV. Everything outside the graded halves is X.
+  5. Third pass: Smart Tagging phases vote for a team (sign learned from the first decode).
+  6. Write a 199,319-row CSV. Everything outside the graded halves is X.
 
 Second-half trap (FAQ.md): the half is graded from frame 110,808 but kicks off at 113,742.
 Those 2,934 frames are all D, so they are written as D and the model only runs from the kick-off.
@@ -26,18 +27,26 @@ Nothing here depends on attacking direction, so the change of ends needs no hand
 """
 import argparse
 import os
+import sys
 import warnings
 from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
 
+# Repo root = the folder above solution/. Paths are built from it, so the output does not depend on
+# the directory the command is started from.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)                                      # so `import games` always works
+
 N_FRAMES = 199_319
 FPS = 25
 PITCH_L, PITCH_W = 105.3, 68.0           # metres (games.py value, measured from corrected tracking)
 HALVES = {1: (11_185, 90_651), 2: (110_808, 190_197)}   # graded frames (DATA.md)
 HALF2_KICKOFF = 113_742                  # FAQ.md: frames 110,808..113,741 are graded and all D
-GT_PUBLIC = "evaluation/gt/BAR-ATH_possession_gt_public.csv"
+GT_PUBLIC = os.path.join(ROOT, "evaluation", "gt", "BAR-ATH_possession_gt_public.csv")
+RESULTS_DIR = os.path.join(ROOT, "evaluation", "results")
 
 H, A, D = 0, 1, 2                        # state indices
 LABELS = np.array(["H", "A", "D"])
@@ -557,8 +566,8 @@ def label_half(start, hi, data, ev, cfg, use_prior, fallback_team=None):
     source = "tag" if init_team is not None else None
     if init_team is None:
         near = ev[is_ko & ev["f0"].between(start - 3000, start + 3000)]
-        print("  no kick-off team from the tags. Kick-off rows within 2 min of frame %d:" % start)
-        print(near[["f0", "f1", "Type", "Team"]].to_string(index=False) if len(near) else "    (none)")
+        # A count only: raw tag rows are match data and must not end up in pasted output.
+        print("  no kick-off team from the tags (%d kick-off tags nearby, none with a team)" % len(near))
         if fallback_team is not None:
             init_team, source = fallback_team, "assumed: the other team than in the first half"
             print("  assuming the other team kicks off the second half")
@@ -579,7 +588,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--half", choices=["1", "2", "both"], default="both")
     ap.add_argument("--minutes", type=float, default=None,
-                    help="only label this many minutes after each kick-off (quick test)")
+                    help="only label this many minutes after each kick-off (quick test, writes quick_test.csv)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--diagnose", action="store_true", help="cue quality + set-piece tags vs the public GT")
     ap.add_argument("--align", action="store_true", help="where does the stoppage sit around each tag? (no GT)")
@@ -599,8 +608,10 @@ def main():
         if args.minutes:
             hi = min(hi, start + int(args.minutes * 60 * FPS) - 1)
         plan.append((h, g_lo, start, hi))
-    out = args.out or "evaluation/results/%s.csv" % {"1": "first_half", "2": "second_half",
-                                                      "both": "full_match"}[args.half]
+    partial = bool(args.minutes) or args.half != "both"
+    # A quick test never overwrites the real submission: it gets its own file name.
+    name = "quick_test" if args.minutes else {"1": "first_half", "2": "second_half", "both": "full_match"}[args.half]
+    out = args.out or os.path.join(RESULTS_DIR, name + ".csv")
 
     datas = load_atd([(start, hi) for _, _, start, hi in plan])
     ev = load_tags()
@@ -642,14 +653,17 @@ def main():
             sweep(r["S"], r["init_team"], cfg, win)
 
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    pd.DataFrame({"frame": np.arange(N_FRAMES), "label": labels}).to_csv(out, index=False)
-    print("\nwrote %s  (%s)" % (out, ", ".join("%s=%d" % (c, (labels == c).sum()) for c in "HADX")))
+    # "\n" on every system: pandas would write "\r\n" on Windows, and the submission has to be
+    # regenerated byte for byte whatever machine it is run on.
+    pd.DataFrame({"frame": np.arange(N_FRAMES), "label": labels}).to_csv(out, index=False, lineterminator="\n")
+    shown = os.path.relpath(out)
+    print("\nwrote %s  (%s)" % (shown, ", ".join("%s=%d" % (c, (labels == c).sum()) for c in "HADX")))
 
     if gt is not None:
         quick_check(labels, gt)                                   # only the first 5 minutes have a GT
-    if args.half != "both":
-        print("\nnote: this is a partial submission, do not upload it as final")
-    print("next: python evaluation/validate_submission.py %s && python evaluation/run_evaluation.py" % out)
+    if partial:
+        print("\nnote: this is a partial file, do not upload it as final")
+    print("next: python evaluation/validate_submission.py %s && python evaluation/run_evaluation.py" % shown)
 
 
 if __name__ == "__main__":
